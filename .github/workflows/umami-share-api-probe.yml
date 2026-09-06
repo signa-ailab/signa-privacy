@@ -1,0 +1,128 @@
+name: Umami Share API Probe Once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/umami-share-api-probe.yml
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Probe Umami public share API
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, time, urllib.request, urllib.error
+
+          SLUG = "OdDeX9fVWUSAZWw6"
+          BASES = [
+              "https://cloud.umami.is/analytics/eu",
+              "https://cloud.umami.is/analytics/us",
+              "https://cloud.umami.is",
+          ]
+
+          def fetch(url, headers=None):
+              req = urllib.request.Request(url, headers=headers or {"Accept": "application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      body = r.read().decode("utf-8", errors="replace")
+                      return r.status, r.headers.get("content-type", ""), body
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", errors="replace")
+                  return e.code, e.headers.get("content-type", ""), body
+              except Exception as e:
+                  return -1, "", repr(e)
+
+          resolved = None
+          for base in BASES:
+              url = f"{base}/api/share/{SLUG}"
+              status, ctype, body = fetch(url)
+              print(f"SHARE_RESOLVE base={base} status={status} ctype={ctype}")
+              if status == 200:
+                  try:
+                      data = json.loads(body)
+                  except Exception:
+                      print("SHARE_BODY_NONJSON", body[:300])
+                      continue
+                  print("SHARE_KEYS", sorted(data.keys()))
+                  print("SHARE_WEBSITE_ID", data.get("websiteId") or data.get("entityId"))
+                  if data.get("token"):
+                      resolved = (base, data)
+                      break
+              elif status not in (404,):
+                  print("SHARE_ERROR_BODY", body[:500])
+
+          if not resolved:
+              raise SystemExit("PROBE_FAIL: no compatible public share API endpoint resolved")
+
+          base, data = resolved
+          token = data["token"]
+          website_id = data.get("websiteId") or data.get("entityId")
+          if not website_id:
+              raise SystemExit("PROBE_FAIL: share response had no website/entity id")
+
+          print("RESOLVED_BASE", base)
+          print("RESOLVED_WEBSITE_ID", website_id)
+          print("SHARE_TOKEN_PRESENT", True)
+
+          headers = {
+              "Accept": "application/json",
+              "x-umami-share-token": token,
+              "x-umami-share-context": "1",
+          }
+          now = int(time.time() * 1000)
+          windows = {
+              "24h": now - 24 * 60 * 60 * 1000,
+              "7d": now - 7 * 24 * 60 * 60 * 1000,
+          }
+
+          for label, start in windows.items():
+              url = f"{base}/api/websites/{website_id}/stats?startAt={start}&endAt={now}"
+              status, ctype, body = fetch(url, headers)
+              print(f"STATS_{label} status={status}")
+              print(body[:4000])
+
+          start = windows["7d"]
+          for metric in ["path", "entry", "exit", "referrer", "channel", "country", "region", "city", "browser", "os", "device", "event"]:
+              url = f"{base}/api/websites/{website_id}/metrics?startAt={start}&endAt={now}&type={metric}&limit=50&offset=0"
+              status, ctype, body = fetch(url, headers)
+              print(f"METRIC_{metric} status={status}")
+              print(body[:4000])
+
+          url = f"{base}/api/websites/{website_id}/events/stats?startAt={start}&endAt={now}"
+          status, ctype, body = fetch(url, headers)
+          print(f"EVENT_STATS status={status}")
+          print(body[:4000])
+
+          url = f"{base}/api/websites/{website_id}/events?startAt={start}&endAt={now}&page=1&pageSize=50&search=google-play-click"
+          status, ctype, body = fetch(url, headers)
+          print(f"GOOGLE_PLAY_EVENTS status={status}")
+          print(body[:6000])
+
+          print("PROBE_PASS")
+          PY
+
+      - name: Remove one-shot probe workflow
+        if: always()
+        shell: bash
+        run: |
+          rm -f .github/workflows/umami-share-api-probe.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "chore: remove one-shot Umami API probe"
+          git push origin main
